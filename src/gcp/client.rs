@@ -100,6 +100,7 @@ enum Error {
     #[error("Error performing complete multipart request: {}", source)]
     CompleteMultipartRequest {
         source: crate::client::retry::RetryError,
+        path: String,
     },
 
     #[error("Error getting complete multipart response body: {}", source)]
@@ -123,9 +124,9 @@ enum Error {
 impl From<Error> for crate::Error {
     fn from(err: Error) -> Self {
         match err {
-            Error::GetRequest { source, path } | Error::Request { source, path } => {
-                source.error(STORE, path)
-            }
+            Error::GetRequest { source, path }
+            | Error::Request { source, path }
+            | Error::CompleteMultipartRequest { source, path } => source.error(STORE, path),
             _ => Self::Generic {
                 store: STORE,
                 source: Box::new(err),
@@ -539,7 +540,10 @@ impl GoogleCloudStorageClient {
             .idempotent(true)
             .send()
             .await
-            .map_err(|source| Error::CompleteMultipartRequest { source })?;
+            .map_err(|source| Error::CompleteMultipartRequest {
+                source,
+                path: path.to_string(),
+            })?;
 
         let version = get_version(response.headers(), VERSION_HEADER)
             .map_err(|source| Error::Metadata { source })?;

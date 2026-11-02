@@ -27,6 +27,7 @@ use futures_util::{StreamExt, stream::BoxStream};
 use parking_lot::RwLock;
 
 use crate::multipart::{MultipartStore, PartId};
+use crate::upload::MultipartUploadMode;
 use crate::util::InvalidGetRange;
 use crate::{
     Attributes, GetRange, GetResult, GetResultPayload, ListResult, MultipartId, MultipartUpload,
@@ -122,12 +123,25 @@ struct PartStorage {
 type SharedStorage = Arc<RwLock<Storage>>;
 
 impl Storage {
-    fn insert(&mut self, location: &Path, bytes: Bytes, attributes: Attributes) -> usize {
+    fn put(
+        &mut self,
+        location: &Path,
+        bytes: Bytes,
+        attributes: Attributes,
+        mode: PutMode,
+    ) -> Result<PutResult> {
         let etag = self.next_etag;
-        self.next_etag += 1;
         let entry = Entry::new(bytes, Utc::now(), etag, attributes);
-        self.overwrite(location, entry);
-        etag
+        match mode {
+            PutMode::Overwrite => self.overwrite(location, entry),
+            PutMode::Create => self.create(location, entry)?,
+            PutMode::Update(version) => self.update(location, version, entry)?,
+        }
+        self.next_etag += 1;
+        Ok(PutResult {
+            e_tag: Some(etag.to_string()),
+            version: None,
+        })
     }
 
     fn overwrite(&mut self, location: &Path, entry: Entry) {
@@ -204,21 +218,9 @@ impl ObjectStore for InMemory {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
-        let mut storage = self.storage.write();
-        let etag = storage.next_etag;
-        let entry = Entry::new(payload.into(), Utc::now(), etag, opts.attributes);
-
-        match opts.mode {
-            PutMode::Overwrite => storage.overwrite(location, entry),
-            PutMode::Create => storage.create(location, entry)?,
-            PutMode::Update(v) => storage.update(location, v, entry)?,
-        }
-        storage.next_etag += 1;
-
-        Ok(PutResult {
-            e_tag: Some(etag.to_string()),
-            version: None,
-        })
+        self.storage
+            .write()
+            .put(location, payload.into(), opts.attributes, opts.mode)
     }
 
     async fn put_multipart_opts(
@@ -227,6 +229,7 @@ impl ObjectStore for InMemory {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         Ok(Box::new(InMemoryUpload {
+            mode: MultipartUploadMode::Overwrite,
             location: location.clone(),
             attributes: opts.attributes,
             parts: vec![],
@@ -395,22 +398,13 @@ impl ObjectStore for InMemory {
         let entry = self.entry(from)?;
         let mut storage = self.storage.write();
 
-        match mode {
-            CopyMode::Overwrite => {
-                storage.insert(to, entry.data, entry.attributes);
-            }
-            CopyMode::Create => {
-                if storage.map.contains_key(to) {
-                    return Err(Error::AlreadyExists {
-                        path: to.to_string(),
-                    }
-                    .into());
-                }
-                storage.insert(to, entry.data, entry.attributes);
-            }
-        }
-
-        Ok(())
+        let mode = match mode {
+            CopyMode::Overwrite => PutMode::Overwrite,
+            CopyMode::Create => PutMode::Create,
+        };
+        storage
+            .put(to, entry.data, entry.attributes, mode)
+            .map(|_| ())
     }
 }
 
@@ -448,22 +442,16 @@ impl MultipartStore for InMemory {
         id: &MultipartId,
         _parts: Vec<PartId>,
     ) -> Result<PutResult> {
-        let mut storage = self.storage.write();
-        let upload = storage.remove_upload(id)?;
+        self.complete_upload(path, id, PutMode::Overwrite)
+    }
 
-        let mut cap = 0;
-        for (part, x) in upload.parts.iter().enumerate() {
-            cap += x.as_ref().ok_or(Error::MissingPart { part })?.len();
-        }
-        let mut buf = Vec::with_capacity(cap);
-        for x in &upload.parts {
-            buf.extend_from_slice(x.as_ref().unwrap())
-        }
-        let etag = storage.insert(path, buf.into(), Default::default());
-        Ok(PutResult {
-            e_tag: Some(etag.to_string()),
-            version: None,
-        })
+    async fn complete_multipart_create(
+        &self,
+        path: &Path,
+        id: &MultipartId,
+        _parts: Vec<PartId>,
+    ) -> Result<PutResult> {
+        self.complete_upload(path, id, PutMode::Create)
     }
 
     async fn abort_multipart(&self, _path: &Path, id: &MultipartId) -> Result<()> {
@@ -473,6 +461,22 @@ impl MultipartStore for InMemory {
 }
 
 impl InMemory {
+    fn complete_upload(&self, path: &Path, id: &MultipartId, mode: PutMode) -> Result<PutResult> {
+        let mut storage = self.storage.write();
+        let upload = storage.upload_mut(id)?;
+        let mut cap = 0;
+        for (part, data) in upload.parts.iter().enumerate() {
+            cap += data.as_ref().ok_or(Error::MissingPart { part })?.len();
+        }
+        let mut buf = Vec::with_capacity(cap);
+        for data in &upload.parts {
+            buf.extend_from_slice(data.as_ref().unwrap());
+        }
+        let result = storage.put(path, buf.into(), Default::default(), mode)?;
+        storage.remove_upload(id)?;
+        Ok(result)
+    }
+
     /// Create new in-memory storage.
     pub fn new() -> Self {
         Self::default()
@@ -502,10 +506,29 @@ impl InMemory {
 
 #[derive(Debug)]
 struct InMemoryUpload {
+    mode: MultipartUploadMode,
     location: Path,
     attributes: Attributes,
     parts: Vec<PutPayload>,
     storage: Arc<RwLock<Storage>>,
+}
+
+impl InMemoryUpload {
+    fn finish(&self) -> Result<PutResult> {
+        let bytes = self
+            .parts
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<PutPayload>()
+            .into();
+        self.storage.write().put(
+            &self.location,
+            bytes,
+            self.attributes.clone(),
+            self.mode.into(),
+        )
+    }
 }
 
 #[async_trait]
@@ -515,21 +538,13 @@ impl MultipartUpload for InMemoryUpload {
         Box::pin(futures_util::future::ready(Ok(())))
     }
 
-    async fn complete(&mut self) -> Result<PutResult> {
-        let cap = self.parts.iter().map(|x| x.content_length()).sum();
-        let mut buf = Vec::with_capacity(cap);
-        let parts = self.parts.iter().flatten();
-        parts.for_each(|x| buf.extend_from_slice(x));
-        let etag = self.storage.write().insert(
-            &self.location,
-            buf.into(),
-            std::mem::take(&mut self.attributes),
-        );
+    fn set_put_mode(&mut self, mode: PutMode) -> Result<()> {
+        self.mode = MultipartUploadMode::try_from(mode)?;
+        Ok(())
+    }
 
-        Ok(PutResult {
-            e_tag: Some(etag.to_string()),
-            version: None,
-        })
+    async fn complete(&mut self) -> Result<PutResult> {
+        self.finish()
     }
 
     async fn abort(&mut self) -> Result<()> {
@@ -546,6 +561,9 @@ mod tests {
     #[tokio::test]
     async fn in_memory_test() {
         let integration = InMemory::new();
+
+        multipart_create(&integration).await;
+        multipart_store_create(&integration, &integration).await;
 
         put_get_delete_list(&integration).await;
         list_with_offset_exclusivity(&integration).await;

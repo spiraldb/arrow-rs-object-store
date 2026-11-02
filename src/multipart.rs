@@ -24,7 +24,7 @@
 use async_trait::async_trait;
 
 use crate::path::Path;
-use crate::{MultipartId, PutPayload, PutResult, Result};
+use crate::{Error, MultipartId, PutPayload, PutResult, Result};
 
 /// Represents a part of a file that has been successfully uploaded in a multipart upload process.
 #[derive(Debug, Clone)]
@@ -81,4 +81,69 @@ pub trait MultipartStore: Send + Sync + 'static {
 
     /// Aborts a multipart upload
     async fn abort_multipart(&self, path: &Path, id: &MultipartId) -> Result<()>;
+
+    /// Complete an upload atomically only if no object exists at `path`.
+    ///
+    /// The same part ordering requirements as [`Self::complete_multipart`] apply.
+    /// Returns [`Error::AlreadyExists`] if the destination exists, or
+    /// [`Error::NotSupported`] if conditional completion is unsupported.
+    /// See [`MultipartUpload::complete`](crate::MultipartUpload::complete) for uncertain
+    /// publication outcomes and cleanup.
+    async fn complete_multipart_create(
+        &self,
+        _path: &Path,
+        _id: &MultipartId,
+        _parts: Vec<PartId>,
+    ) -> Result<PutResult> {
+        Err(Error::NotSupported {
+            source: "create-only multipart completion is not supported".into(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestMultipartStore;
+
+    #[tokio::test]
+    async fn unsupported_create_does_not_overwrite() {
+        assert!(matches!(
+            TestMultipartStore
+                .complete_multipart_create(&Path::from("test"), &"upload".into(), vec![])
+                .await,
+            Err(Error::NotSupported { .. })
+        ));
+    }
+
+    #[async_trait]
+    impl MultipartStore for TestMultipartStore {
+        async fn create_multipart(&self, _path: &Path) -> Result<MultipartId> {
+            Ok("test".into())
+        }
+
+        async fn put_part(
+            &self,
+            _path: &Path,
+            _id: &MultipartId,
+            _part_idx: usize,
+            _data: PutPayload,
+        ) -> Result<PartId> {
+            unreachable!()
+        }
+
+        async fn complete_multipart(
+            &self,
+            _path: &Path,
+            _id: &MultipartId,
+            _parts: Vec<PartId>,
+        ) -> Result<PutResult> {
+            unreachable!()
+        }
+
+        async fn abort_multipart(&self, _path: &Path, _id: &MultipartId) -> Result<()> {
+            unreachable!()
+        }
+    }
 }

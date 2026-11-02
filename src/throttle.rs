@@ -24,7 +24,7 @@ use crate::multipart::{MultipartStore, PartId};
 use crate::{CopyOptions, GetOptions, RenameOptions, UploadPart};
 use crate::{
     GetResult, GetResultPayload, ListResult, MultipartId, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
+    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, path::Path,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -333,6 +333,15 @@ impl<T: MultipartStore> MultipartStore for ThrottledStore<T> {
     async fn abort_multipart(&self, path: &Path, id: &MultipartId) -> Result<()> {
         self.inner.abort_multipart(path, id).await
     }
+
+    async fn complete_multipart_create(
+        &self,
+        path: &Path,
+        id: &MultipartId,
+        parts: Vec<PartId>,
+    ) -> Result<PutResult> {
+        self.inner.complete_multipart_create(path, id, parts).await
+    }
 }
 
 #[derive(Debug)]
@@ -354,6 +363,10 @@ impl MultipartUpload for ThrottledUpload {
 
     async fn complete(&mut self) -> Result<PutResult> {
         self.upload.complete().await
+    }
+
+    fn set_put_mode(&mut self, mode: PutMode) -> Result<()> {
+        self.upload.set_put_mode(mode)
     }
 
     async fn abort(&mut self) -> Result<()> {
@@ -392,6 +405,9 @@ mod tests {
     async fn throttle_test() {
         let inner = InMemory::new();
         let store = ThrottledStore::new(inner, ThrottleConfig::default());
+
+        multipart_create(&store).await;
+        multipart_store_create(&store, &store).await;
 
         put_get_delete_list(&store).await;
         list_uses_directories_correctly(&store).await;

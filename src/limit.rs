@@ -19,7 +19,7 @@
 
 use crate::{
     BoxStream, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload,
-    ObjectMeta, ObjectStore, Path, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    ObjectMeta, ObjectStore, Path, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     RenameOptions, Result, StreamExt, UploadPart,
 };
 use async_trait::async_trait;
@@ -233,6 +233,10 @@ impl MultipartUpload for LimitUpload {
         self.upload.complete().await
     }
 
+    fn set_put_mode(&mut self, mode: PutMode) -> Result<()> {
+        self.upload.set_put_mode(mode)
+    }
+
     async fn abort(&mut self) -> Result<()> {
         let _permit = self.semaphore.acquire().await.unwrap();
         self.upload.abort().await
@@ -255,6 +259,8 @@ mod tests {
         let max_requests = 10;
         let memory = InMemory::new();
         let integration = LimitStore::new(memory, max_requests);
+
+        multipart_create(&integration).await;
 
         put_get_delete_list(&integration).await;
         get_opts(&integration).await;
