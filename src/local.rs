@@ -23,6 +23,7 @@ use std::ops::Range;
 use std::os::unix::fs::FileExt;
 #[cfg(target_family = "windows")]
 use std::os::windows::fs::FileExt;
+use std::path::Path as StdPath;
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::{collections::BTreeSet, io};
@@ -1115,6 +1116,36 @@ impl LocalUpload {
             fsync,
         }
     }
+
+    async fn publish(
+        &mut self,
+        finish_staged: fn(File, &StdPath, &StdPath, bool) -> Result<()>,
+    ) -> Result<PutResult> {
+        let src = self.src.clone().ok_or(Error::Aborted)?;
+        let s = Arc::clone(&self.state);
+        let fsync = self.fsync;
+        let result = maybe_spawn_blocking(move || {
+            // Ensure no inflight writes
+            let mut guard = s.file.lock();
+            let file = guard.take().ok_or(Error::Aborted)?;
+
+            let metadata = file.metadata().map_err(|e| Error::Metadata {
+                source: e.into(),
+                path: src.to_string_lossy().to_string(),
+            })?;
+
+            finish_staged(file, &src, &s.dest, fsync)?;
+
+            Ok(PutResult {
+                e_tag: Some(get_etag(&metadata)),
+                version: None,
+                extensions: Default::default(),
+            })
+        })
+        .await?;
+        self.src = None;
+        Ok(result)
+    }
 }
 
 #[async_trait]
@@ -1142,31 +1173,11 @@ impl MultipartUpload for LocalUpload {
     }
 
     async fn complete(&mut self) -> Result<PutResult> {
-        let src = self.src.take().ok_or(Error::Aborted)?;
-        let s = Arc::clone(&self.state);
-        let fsync = self.fsync;
-        maybe_spawn_blocking(move || {
-            // Ensure no inflight writes
-            let mut guard = s.file.lock();
-            let file = guard.take().ok_or(Error::Aborted)?;
+        self.publish(finish_staged_rename).await
+    }
 
-            let metadata = file.metadata().map_err(|e| Error::Metadata {
-                source: e.into(),
-                path: src.to_string_lossy().to_string(),
-            })?;
-
-            // Durably publish the freshly-written staging file: flush its contents, close it, then
-            // rename it into place and fsync the destination's parent directory (the fsync calls
-            // are bundled into the helper and only run when fsync is enabled).
-            finish_staged_rename(file, &src, &s.dest, fsync)?;
-
-            Ok(PutResult {
-                e_tag: Some(get_etag(&metadata)),
-                version: None,
-                extensions: Default::default(),
-            })
-        })
-        .await
+    async fn complete_create(&mut self) -> Result<PutResult> {
+        self.publish(finish_staged_hard_link).await
     }
 
     async fn abort(&mut self) -> Result<()> {
@@ -1542,6 +1553,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         let integration = LocalFileSystem::new_with_prefix(root.path()).unwrap();
 
+        multipart_create(&integration).await;
+
         put_get_delete_list(&integration).await;
         list_with_offset_exclusivity(&integration).await;
         get_opts(&integration).await;
@@ -1564,6 +1577,8 @@ mod tests {
         let integration = LocalFileSystem::new_with_prefix(root.path())
             .unwrap()
             .with_fsync(true);
+
+        multipart_create(&integration).await;
 
         put_get_delete_list(&integration).await;
         list_with_offset_exclusivity(&integration).await;
@@ -2283,7 +2298,30 @@ mod not_wasm_tests {
     use tempfile::TempDir;
 
     use crate::local::LocalFileSystem;
-    use crate::{ObjectStoreExt, Path, PutPayload};
+    use crate::{Error, ObjectStoreExt, Path, PutPayload};
+
+    #[tokio::test]
+    async fn test_abort_after_failed_create_completion() {
+        let root = TempDir::new().unwrap();
+        let storage = LocalFileSystem::new_with_prefix(root.path()).unwrap();
+        let path = Path::from("object");
+        storage.put(&path, "first".into()).await.unwrap();
+        let mut upload = storage.put_multipart(&path).await.unwrap();
+        upload.put_part("second".into()).await.unwrap();
+
+        assert!(matches!(
+            upload.complete_create().await,
+            Err(Error::AlreadyExists { .. })
+        ));
+        let _ = upload.complete().await;
+        upload.abort().await.unwrap();
+
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(
+            storage.get(&path).await.unwrap().bytes().await.unwrap(),
+            "first"
+        );
+    }
 
     #[tokio::test]
     async fn test_cleanup_intermediate_files() {

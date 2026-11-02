@@ -76,6 +76,23 @@ pub trait MultipartUpload: Send + std::fmt::Debug {
     /// on an already completed or aborted [`MultipartUpload`].
     async fn complete(&mut self) -> Result<PutResult>;
 
+    /// Complete the upload only if no object exists at its destination.
+    ///
+    /// The existence check and publication must be atomic. Implementations without
+    /// conditional completion return an error; they must not fall back to overwrite.
+    /// A failed upload can still be cleaned up with [`Self::abort`].
+    /// An I/O error may leave the publication outcome uncertain; aborting does not
+    /// remove an object that was already published. Verify the destination's contents
+    /// before starting another upload, and do not assume completion can be retried.
+    ///
+    /// Returns [`crate::Error::AlreadyExists`] if the destination exists, or
+    /// [`crate::Error::NotSupported`] if the backend cannot enforce this condition.
+    async fn complete_create(&mut self) -> Result<PutResult> {
+        Err(crate::Error::NotSupported {
+            source: "create-only multipart completion is not supported".into(),
+        })
+    }
+
     /// Abort the multipart upload
     ///
     /// If a [`MultipartUpload`] is dropped without calling [`MultipartUpload::complete`],
@@ -102,6 +119,10 @@ impl<W: MultipartUpload + ?Sized> MultipartUpload for Box<W> {
 
     async fn complete(&mut self) -> Result<PutResult> {
         (**self).complete().await
+    }
+
+    async fn complete_create(&mut self) -> Result<PutResult> {
+        (**self).complete_create().await
     }
 
     async fn abort(&mut self) -> Result<()> {
@@ -284,6 +305,14 @@ mod tests {
     #[derive(Debug, Default)]
     struct InstrumentedUpload {
         chunks: Arc<Mutex<Vec<PutPayload>>>,
+    }
+
+    #[tokio::test]
+    async fn unsupported_create_does_not_overwrite() {
+        assert!(matches!(
+            InstrumentedUpload::default().complete_create().await,
+            Err(crate::Error::NotSupported { .. })
+        ));
     }
 
     #[async_trait]
