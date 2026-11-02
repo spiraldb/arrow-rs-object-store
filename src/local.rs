@@ -37,6 +37,7 @@ use parking_lot::Mutex;
 use url::Url;
 use walkdir::{DirEntry, WalkDir};
 
+use crate::upload::MultipartUploadMode;
 use crate::{
     Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
@@ -829,6 +830,7 @@ fn staged_upload_path(dest: &std::path::Path, suffix: &str) -> PathBuf {
 
 #[derive(Debug)]
 struct LocalUpload {
+    mode: MultipartUploadMode,
     /// The upload state
     state: Arc<UploadState>,
     /// The location of the temporary file
@@ -846,6 +848,7 @@ struct UploadState {
 impl LocalUpload {
     pub(crate) fn new(src: PathBuf, dest: PathBuf, file: File) -> Self {
         Self {
+            mode: MultipartUploadMode::Overwrite,
             state: Arc::new(UploadState {
                 dest,
                 file: Mutex::new(file),
@@ -879,25 +882,48 @@ impl MultipartUpload for LocalUpload {
         .boxed()
     }
 
+    fn set_put_mode(&mut self, mode: PutMode) -> Result<()> {
+        self.mode = MultipartUploadMode::try_from(mode)?;
+        Ok(())
+    }
+
     async fn complete(&mut self) -> Result<PutResult> {
-        let src = self.src.take().ok_or(Error::Aborted)?;
+        let src = self.src.clone().ok_or(Error::Aborted)?;
         let s = Arc::clone(&self.state);
-        maybe_spawn_blocking(move || {
+        let mode = self.mode;
+        let result = maybe_spawn_blocking(move || {
             // Ensure no inflight writes
             let file = s.file.lock();
-            std::fs::rename(&src, &s.dest)
-                .map_err(|source| Error::UnableToRenameFile { source })?;
             let metadata = file.metadata().map_err(|e| Error::Metadata {
                 source: e.into(),
                 path: src.to_string_lossy().to_string(),
             })?;
+
+            match mode {
+                MultipartUploadMode::Overwrite => {
+                    std::fs::rename(&src, &s.dest)
+                        .map_err(|source| Error::UnableToRenameFile { source })?;
+                }
+                MultipartUploadMode::Create => {
+                    std::fs::hard_link(&src, &s.dest).map_err(|source| match source.kind() {
+                        ErrorKind::AlreadyExists => Error::AlreadyExists {
+                            path: s.dest.to_string_lossy().into_owned(),
+                            source,
+                        },
+                        _ => Error::UnableToRenameFile { source },
+                    })?;
+                    let _ = std::fs::remove_file(&src);
+                }
+            }
 
             Ok(PutResult {
                 e_tag: Some(get_etag(&metadata)),
                 version: None,
             })
         })
-        .await
+        .await?;
+        self.src = None;
+        Ok(result)
     }
 
     async fn abort(&mut self) -> Result<()> {
@@ -1269,6 +1295,8 @@ mod tests {
     async fn file_test() {
         let root = TempDir::new().unwrap();
         let integration = LocalFileSystem::new_with_prefix(root.path()).unwrap();
+
+        multipart_create(&integration).await;
 
         put_get_delete_list(&integration).await;
         list_with_offset_exclusivity(&integration).await;
@@ -1856,7 +1884,30 @@ mod not_wasm_tests {
     use tempfile::TempDir;
 
     use crate::local::LocalFileSystem;
-    use crate::{ObjectStoreExt, Path, PutPayload};
+    use crate::{Error, ObjectStoreExt, Path, PutMode, PutPayload};
+
+    #[tokio::test]
+    async fn test_abort_after_failed_create_completion() {
+        let root = TempDir::new().unwrap();
+        let storage = LocalFileSystem::new_with_prefix(root.path()).unwrap();
+        let path = Path::from("object");
+        storage.put(&path, "first".into()).await.unwrap();
+        let mut upload = storage.put_multipart(&path).await.unwrap();
+        upload.put_part("second".into()).await.unwrap();
+
+        upload.set_put_mode(PutMode::Create).unwrap();
+        assert!(matches!(
+            upload.complete().await,
+            Err(Error::AlreadyExists { .. })
+        ));
+        upload.abort().await.unwrap();
+
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        assert_eq!(
+            storage.get(&path).await.unwrap().bytes().await.unwrap(),
+            "first"
+        );
+    }
 
     #[tokio::test]
     async fn test_cleanup_intermediate_files() {
