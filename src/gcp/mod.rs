@@ -303,11 +303,56 @@ impl PaginatedListStore for GoogleCloudStorage {
 mod test {
     use credential::DEFAULT_GCS_BASE_URL;
 
-    use crate::ObjectStoreExt;
+    use crate::client::mock_server::MockServer;
     use crate::integration::*;
     use crate::tests::*;
+    use crate::{ClientOptions, Error, ObjectStoreExt, RetryConfig};
+    use http::{Response, StatusCode};
 
     use super::*;
+
+    #[tokio::test]
+    async fn multipart_completion_preserves_error_status() {
+        let mock = MockServer::new().await;
+        let store = GoogleCloudStorageBuilder::new()
+            .with_bucket_name("test")
+            .with_base_url(mock.url())
+            .with_client_options(ClientOptions::new().with_allow_http(true))
+            .with_skip_signature(true)
+            .with_retry(RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            })
+            .build()
+            .unwrap();
+        let path = Path::from("object");
+        for status in [StatusCode::PRECONDITION_FAILED, StatusCode::FORBIDDEN] {
+            mock.push(
+                Response::builder()
+                    .status(status)
+                    .body(String::new())
+                    .unwrap(),
+            );
+            let error = store
+                .complete_multipart(
+                    &path,
+                    &"upload".into(),
+                    vec![PartId {
+                        content_id: "part".into(),
+                    }],
+                )
+                .await
+                .unwrap_err();
+            match (status, error) {
+                (StatusCode::PRECONDITION_FAILED, Error::Precondition { path: failed, .. })
+                | (StatusCode::FORBIDDEN, Error::PermissionDenied { path: failed, .. }) => {
+                    assert_eq!(failed, path.as_ref());
+                }
+                (_, error) => panic!("unexpected completion error: {error}"),
+            }
+        }
+        mock.shutdown().await;
+    }
 
     const NON_EXISTENT_NAME: &str = "nonexistentname";
 
