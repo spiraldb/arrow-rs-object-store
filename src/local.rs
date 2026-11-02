@@ -1931,7 +1931,9 @@ mod tests {
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]
 mod not_wasm_tests {
+    use std::future::Future as _;
     use std::sync::Arc;
+    use std::task::{Context, Waker};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -1973,7 +1975,12 @@ mod not_wasm_tests {
             let state = Arc::clone(&upload.state);
             let guard = state.file.lock();
             let mut completion = Box::pin(upload.complete());
-            assert!(futures_util::poll!(&mut completion).is_pending());
+            assert!(
+                completion
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             drop(guard);
             // Let publication finish without polling the completion future again.
             tokio::time::timeout(Duration::from_secs(5), async {
